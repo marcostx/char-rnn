@@ -3,11 +3,11 @@
 
 This file trains a character-level multi-layer RNN on text data
 
-Code is based on implementation in 
+Code is based on implementation in
 https://github.com/oxford-cs-ml-2015/practical6
 but modified to have multi-layer support, GPU support, as well as
 many other common model/optimization bells and whistles.
-The practical6 code is in turn based on 
+The practical6 code is in turn based on
 https://github.com/wojciechz/learning_to_execute
 which is turn based on other stuff in Torch, etc... (long lineage)
 
@@ -23,9 +23,8 @@ require 'util.OneHot'
 require 'util.misc'
 local CharSplitLMMinibatchLoader = require 'util.CharSplitLMMinibatchLoader'
 local model_utils = require 'util.model_utils'
-local LSTM = require 'model.LSTM'
-local GRU = require 'model.GRU'
-local RNN = require 'model.RNN'
+local Top_LSTM = require 'model.Top_LSTM'
+local attention = require 'model.attention'
 
 cmd = torch.CmdLine()
 cmd:text()
@@ -36,8 +35,15 @@ cmd:text('Options')
 cmd:option('-data_dir','data/tinyshakespeare','data directory. Should contain the file input.txt with input data')
 -- model params
 cmd:option('-rnn_size', 128, 'size of LSTM internal state')
+cmd:option('-att_rnn_size', 64, 'size of LSTM internal state (for attention model)')
 cmd:option('-num_layers', 2, 'number of layers in the LSTM')
+cmd:option('-att_model', 'rnn', 'lstm or rnn, we use rnn in the paper')
+cmd:option('-attention_sig_w', 3, 'to validate the learning rate for attention weights, options: {1, 3, 5}, normally 3 is a good option.')
 cmd:option('-model', 'lstm', 'lstm,gru or rnn')
+cmd:option('-if_attention', 1, 'if use attention model')
+cmd:option('-attention_num_layers', 1, 'number of layers in the attention model')
+cmd:option('-class_size', 2, 'number of labels')
+
 -- optimization
 cmd:option('-learning_rate',2e-3,'learning rate')
 cmd:option('-learning_rate_decay',0.97,'learning rate decay')
@@ -52,6 +58,14 @@ cmd:option('-train_frac',0.95,'fraction of data that goes into train set')
 cmd:option('-val_frac',0.05,'fraction of data that goes into validation set')
             -- test_frac will be computed as (1 - train_frac - val_frac)
 cmd:option('-init_from', '', 'initialize network parameters from checkpoint at this path')
+
+cmd:option('-top_c', 'lstm', 'the top classifier: NN, or lstm, or rnn, or gru, or TAGM')
+cmd:option('-if_original_feature', 1, 'if use original feature orelse hidden value for attention model')
+cmd:option('-top_lstm_size', 64, 'size of LSTM internal state (for top lstm model)')
+cmd:option('-top_num_layers', 1, 'number of layers in the top LSTM')
+cmd:option('-top_bidirection', 0, 'if use bidirection on top toc_c')
+
+
 -- bookkeeping
 cmd:option('-seed',123,'torch manual random number generator seed')
 cmd:option('-print_every',1,'how many steps/minibatches between printing out the loss')
@@ -69,7 +83,8 @@ opt = cmd:parse(arg)
 torch.manualSeed(opt.seed)
 -- train / val / test split for data, in fractions
 local test_frac = math.max(0, 1 - (opt.train_frac + opt.val_frac))
-local split_sizes = {opt.train_frac, opt.val_frac, test_frac} 
+local split_sizes = {opt.train_frac, opt.val_frac, test_frac}
+local model = {}
 
 -- initialize cunn/cutorch for training on the GPU and fall back to CPU gracefully
 if opt.gpuid >= 0 and opt.opencl == 0 then
@@ -120,7 +135,7 @@ local do_random_init = true
 if string.len(opt.init_from) > 0 then
     print('loading a model from checkpoint ' .. opt.init_from)
     local checkpoint = torch.load(opt.init_from)
-    protos = checkpoint.protos
+    model = checkpoint.model
     -- make sure the vocabs are the same
     local vocab_compatible = true
     local checkpoint_vocab_size = 0
@@ -143,15 +158,18 @@ if string.len(opt.init_from) > 0 then
     do_random_init = false
 else
     print('creating an ' .. opt.model .. ' with ' .. opt.num_layers .. ' layers')
-    protos = {}
-    if opt.model == 'lstm' then
-        protos.rnn = LSTM.lstm(vocab_size, opt.rnn_size, opt.num_layers, opt.dropout)
-    elseif opt.model == 'gru' then
-        protos.rnn = GRU.gru(vocab_size, opt.rnn_size, opt.num_layers, opt.dropout)
-    elseif opt.model == 'rnn' then
-        protos.rnn = RNN.rnn(vocab_size, opt.rnn_size, opt.num_layers, opt.dropout)
+    local model = {}
+
+    if opt.if_attention == 1 then
+        print('creating attention model with ' .. opt.attention_num_layers .. ' layers')
+        attention.model(loader, opt)
     end
-    protos.criterion = nn.ClassNLLCriterion()
+
+    top_net = Top_LSTM
+    Top_LSTM.net(loader, opt)
+    model.top_net_params_size = top_net.params_size
+
+    model.criterion = nn.ClassNLLCriterion()
 end
 
 -- the initial state of the cell/hidden states
@@ -168,40 +186,50 @@ end
 
 -- ship the model to the GPU if desired
 if opt.gpuid >= 0 and opt.opencl == 0 then
-    for k,v in pairs(protos) do v:cuda() end
+    for k,v in pairs(model) do v:cuda() end
 end
 if opt.gpuid >= 0 and opt.opencl == 1 then
-    for k,v in pairs(protos) do v:cl() end
+    for k,v in pairs(model) do v:cl() end
 end
 
 -- put the above things into one flattened parameters tensor
-params, grad_params = model_utils.combine_all_parameters(protos.rnn)
+params, grad_params = model_utils.combine_all_parameters(attention.rnn, attention.birnn, attention.weight_net, top_net.mul_net, top_net.lstm, top_net.top_c)
 
--- initialization
-if do_random_init then
-    params:uniform(-0.08, 0.08) -- small uniform numbers
-end
+
+top_net.init_params(opt)
+
+attention.clone_model(loader)
+
+model.attention = attention
+model.top_net = top_net
+
+
+--
+-- -- initialization
+-- if do_random_init then
+--     params:uniform(-0.08, 0.08) -- small uniform numbers
+-- end
+
 -- initialize the LSTM forget gates with slightly higher biases to encourage remembering in the beginning
-if opt.model == 'lstm' then
-    for layer_idx = 1, opt.num_layers do
-        for _,node in ipairs(protos.rnn.forwardnodes) do
-            if node.data.annotations.name == "i2h_" .. layer_idx then
-                print('setting forget gate biases to 1 in LSTM layer ' .. layer_idx)
-                -- the gates are, in order, i,f,o,g, so f is the 2nd block of weights
-                node.data.module.bias[{{opt.rnn_size+1, 2*opt.rnn_size}}]:fill(1.0)
-            end
-        end
-    end
-end
+-- if opt.model == 'lstm' then
+--     for layer_idx = 1, opt.num_layers do
+--         for _,node in ipairs(model.lstm.forwardnodes) do
+--             if node.data.annotations.name == "i2h_" .. layer_idx then
+--                 print('setting forget gate biases to 1 in LSTM layer ' .. layer_idx)
+--                 -- the gates are, in order, i,f,o,g, so f is the 2nd block of weights
+--                 node.data.module.bias[{{opt.rnn_size+1, 2*opt.rnn_size}}]:fill(1.0)
+--             end
+--         end
+--     end
+-- end
 
-print('number of parameters in the model: ' .. params:nElement())
 -- make a bunch of clones after flattening, as that reallocates memory
-clones = {}
-for name,proto in pairs(protos) do
-    print('cloning ' .. name)
-    clones[name] = model_utils.clone_many_times(proto, opt.seq_length, not proto.parameters)
-end
-
+-- clones = {}
+-- for name,proto in pairs(model) do
+--     print('cloning ' .. name)
+--     clones[name] = model_utils.clone_many_times(proto, opt.seq_length, not proto.parameters)
+-- end
+os.exit(1)
 -- preprocessing helper function
 function prepro(x,y)
     x = x:transpose(1,2):contiguous() -- swap the axes for faster indexing
@@ -227,7 +255,7 @@ function eval_split(split_index, max_batches)
     loader:reset_batch_pointer(split_index) -- move batch iteration pointer for this split to front
     local loss = 0
     local rnn_state = {[0] = init_state}
-    
+
     for i = 1,n do -- iterate over batches in the split
         -- fetch a batch
         local x, y = loader:next_batch(split_index)
@@ -238,7 +266,7 @@ function eval_split(split_index, max_batches)
             local lst = clones.rnn[t]:forward{x[t], unpack(rnn_state[t-1])}
             rnn_state[t] = {}
             for i=1,#init_state do table.insert(rnn_state[t], lst[i]) end
-            prediction = lst[#lst] 
+            prediction = lst[#lst]
             loss = loss + clones.criterion[t]:forward(prediction, y[t])
         end
         -- carry over lstm state
@@ -285,7 +313,7 @@ function feval(x)
         drnn_state[t-1] = {}
         for k,v in pairs(dlst) do
             if k > 1 then -- k == 1 is gradient on x, which we dont need
-                -- note we do k-1 because first item is dembeddings, and then follow the 
+                -- note we do k-1 because first item is dembeddings, and then follow the
                 -- derivatives of the state, starting at index 2. I know...
                 drnn_state[t-1][k-1] = v
             end
@@ -321,7 +349,7 @@ for i = 1, iterations do
         cutorch.synchronize()
     end
     local time = timer:time().real
-    
+
     local train_loss = loss[1] -- the loss is inside a list, pop it
     train_losses[i] = train_loss
 
@@ -343,7 +371,7 @@ for i = 1, iterations do
         local savefile = string.format('%s/lm_%s_epoch%.2f_%.4f.t7', opt.checkpoint_dir, opt.savefile, epoch, val_loss)
         print('saving checkpoint to ' .. savefile)
         local checkpoint = {}
-        checkpoint.protos = protos
+        checkpoint.model = model
         checkpoint.opt = opt
         checkpoint.train_losses = train_losses
         checkpoint.val_loss = val_loss
@@ -357,7 +385,7 @@ for i = 1, iterations do
     if i % opt.print_every == 0 then
         print(string.format("%d/%d (epoch %.3f), train_loss = %6.8f, grad/param norm = %6.4e, time/batch = %.4fs", i, iterations, epoch, train_loss, grad_params:norm() / params:norm(), time))
     end
-   
+
     if i % 10 == 0 then collectgarbage() end
 
     -- handle early stopping if things are going really bad
@@ -371,5 +399,3 @@ for i = 1, iterations do
         break -- halt
     end
 end
-
-
